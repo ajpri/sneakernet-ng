@@ -1,0 +1,752 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-only
+"""Mirror selected folders to mounted USB drives using rsync."""
+
+import argparse
+from contextlib import ExitStack, contextmanager
+from dataclasses import dataclass, replace
+import fcntl
+from html import escape
+import json
+import os
+from pathlib import Path
+import platform
+import re
+import shlex
+import shutil
+import socket
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+import tomllib
+
+VERSION = "26.11.14"
+MARKER = ".sneakernet"
+UNIT = "sneakernet.service"
+POLL_INTERVAL = 3
+SERVICE = """\
+[Unit]
+Description=SneakerNet USB folder mirror
+
+[Service]
+Type=simple
+ExecStart="%h/.local/bin/sneakernet" watch
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+NoNewPrivileges=yes
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+"""
+
+
+class SyncError(Exception):
+    pass
+
+
+@dataclass(frozen=True)
+class Mount:
+    id: int
+    device: str
+    root: str
+    target: Path
+    filesystem: str
+    writable: bool
+    source: str = ""
+    disk_sequence: str = ""
+
+
+@dataclass(frozen=True)
+class Folder:
+    source: Path
+    destination: Path
+    suffixes: tuple[str, ...]
+    exclusions: tuple[str, ...]
+
+
+def config_home():
+    return Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+
+
+def hostname():
+    return socket.gethostname()
+
+
+def mount_path(value):
+    return re.sub(r"\\([0-7]{3})", lambda match: chr(int(match[1], 8)), value)
+
+
+def mounts():
+    result = []
+    for line in Path("/proc/self/mountinfo").read_text(errors="surrogateescape").split("\n"):
+        if not line:
+            continue
+        info, filesystem = line.split(" - ", 1)
+        mount_id, _, device, root, target, options, *_ = info.split()
+        fs_type, source, super_options = filesystem.split()
+        writable = all("rw" in field.split(",") for field in (options, super_options))
+        result.append(Mount(int(mount_id), device, mount_path(root),
+                            Path(mount_path(target)), fs_type, writable, mount_path(source)))
+    return result
+
+
+def usb_devices():
+    command = ["lsblk", "--json", "--tree", "--paths", "--output", "NAME,MAJ:MIN,TYPE,TRAN"]
+    tree = json.loads(subprocess.check_output(command, timeout=10))
+    devices = {}
+    for disk in tree["blockdevices"]:
+        if disk["type"] == "disk" and disk["tran"] == "usb":
+            try:
+                sequence = Path(f"/sys/dev/block/{disk['maj:min']}/diskseq").read_text().strip()
+            except FileNotFoundError:
+                sequence = ""
+            for device in [disk, *disk.get("children", [])]:
+                if device["type"] in {"disk", "part"}:
+                    devices[device["maj:min"]] = (device["maj:min"], sequence)
+                    devices[device["name"]] = (device["maj:min"], sequence)
+    return devices
+
+
+def usb_mounts():
+    devices = usb_devices()
+    seen = set()
+    for mount in mounts():
+        device = devices.get(mount.device)
+        if device is None and mount.filesystem == "fuseblk":
+            # FUSE reports a virtual device number, so use the backing block device.
+            device = devices.get(mount.source)
+        if mount.root == "/" and device and device[0] not in seen:
+            seen.add(device[0])
+            yield replace(mount, disk_sequence=device[1])
+
+
+def mount_key(mount):
+    return f"{mount.id}:{mount.device}:{mount.disk_sequence}:{mount.target}"
+
+
+@contextmanager
+def open_directory(path, parent_fd=None):
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
+    try:
+        yield fd
+    finally:
+        os.close(fd)
+
+
+def check_mount(fd, mount):
+    info = Path(f"/proc/self/fdinfo/{fd}").read_text().splitlines()
+    mount_id = next(int(line.split()[1]) for line in info if line.startswith("mnt_id:"))
+    if mount_id != mount.id:
+        raise SyncError(f"Mount changed at {mount.target}. Reconnect the drive and try again.")
+
+
+def read_marker(fd):
+    try:
+        marker = os.open(MARKER, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW, dir_fd=fd)
+    except FileNotFoundError:
+        return []
+    with os.fdopen(marker, "rb") as stream:
+        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+            raise SyncError(f"{MARKER} must be a regular file.")
+        contents = stream.read(65537)
+    if len(contents) > 65536:
+        raise SyncError(f"{MARKER} exceeds 64 KiB.")
+    config = tomllib.loads(contents.decode("utf-8"))
+    host = hostname()
+    settings = config.get(host)
+    legacy_hosts = config.get("hosts")
+    if isinstance(legacy_hosts, dict) and (settings is None or (host == "hosts" and host in legacy_hosts)):
+        # Continue reading drives configured with the older [hosts] wrapper.
+        settings = legacy_hosts.get(host)
+    if settings is None:
+        return []
+    if isinstance(settings, dict):
+        settings = [settings]
+    if not isinstance(settings, list) or any(not isinstance(folder, dict) for folder in settings):
+        raise SyncError(f"Use [{toml_key(host)}] for one folder or [[{toml_key(host)}]] for multiple folders.")
+    return load_folders(settings)
+
+
+def file_suffixes(settings, profile):
+    if "file_types" not in settings:
+        # Keep older profiles' selection until the user sets file_types.
+        iso_only = settings.get("iso_only", False)
+        if not isinstance(iso_only, bool):
+            raise SyncError(f"Invalid iso_only in folder {profile!r}.")
+        return (".iso",) if iso_only else ()
+
+    types = settings["file_types"]
+    if isinstance(types, str):
+        types = [types]
+    if not isinstance(types, list) or not types or any(not isinstance(item, str) for item in types):
+        raise SyncError(f"Set file_types in folder {profile!r} to extensions, '*' or 'all'.")
+    types = [item.lower() for item in types]
+    if types == ["*"] or types == ["all"]:
+        return ()
+    if any(item == "all" or not re.fullmatch(r"\.?[a-z0-9_+-]+(?:\.[a-z0-9_+-]+)*", item)
+           for item in types):
+        raise SyncError(f"Invalid file_types in folder {profile!r}. Use extensions or select all on its own.")
+    return tuple(dict.fromkeys("." + item.removeprefix(".") for item in types))
+
+
+def load_folders(settings_list):
+    folders = []
+    destinations = []
+    for index, settings in enumerate(settings_list, start=1):
+        name = f"{hostname()} #{index}"
+        source_setting = settings.get("source")
+        if (not isinstance(source_setting, str) or not Path(source_setting).is_absolute()
+                or "\x00" in source_setting):
+            raise SyncError(f"Source for folder {name!r} must be an absolute path starting with '/'.")
+        source = Path(source_setting)
+        destination = settings.get("destination")
+        exclusions = settings.get("exclude", [])
+        if not isinstance(destination, str) or not destination:
+            raise SyncError(f"Set a destination for folder {name!r}.")
+        target = Path(destination)
+        if (target.is_absolute() or ".." in target.parts or "\x00" in destination
+                or (target.parts and target.parts[0].casefold() == MARKER)):
+            raise SyncError(f"Destination for {name!r} must be relative to the drive root.")
+        if not isinstance(exclusions, list) or any(
+            not isinstance(entry, str) or not entry or entry in {".", ".."}
+            or re.search(r"[/\\*?\[\]\x00-\x1f]", entry) for entry in exclusions
+        ):
+            raise SyncError(f"Exclusions for {name!r} must be literal top-level names.")
+        compare = Path(str(target).casefold())
+        if any(compare == other or compare in other.parents or other in compare.parents
+               for other in destinations):
+            raise SyncError(f"Destination {destination!r} overlaps another folder's destination.")
+        destinations.append(compare)
+        folders.append(Folder(source, target, file_suffixes(settings, name), tuple(exclusions)))
+    return folders
+
+
+@contextmanager
+def sync_lock(blocking=True):
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    if not runtime:
+        raise SyncError("Run SneakerNet from your Linux user session (XDG_RUNTIME_DIR is missing).")
+    fd = os.open(Path(runtime) / "sneakernet.lock",
+                 os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+        except BlockingIOError:
+            yield None
+        else:
+            yield fd
+    finally:
+        os.close(fd)
+
+
+def say(message):
+    print(message, flush=True)
+
+
+def notify(title, message):
+    say(f"{title} — {message}")
+    if not shutil.which("notify-send"):
+        return
+    try:
+        result = subprocess.run(
+            ["notify-send", "--app-name=SneakerNet", "--", title, escape(message)],
+            timeout=5, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        if result.returncode:
+            say("Desktop notification unavailable.")
+    except (OSError, subprocess.TimeoutExpired):
+        say("Desktop notification unavailable.")
+
+
+def validate_paths(source, target, current_mounts):
+    if source == target or source in target.parents or target in source.parents:
+        raise SyncError(f"Source {source} and drive {target} must be separate.")
+    for other in current_mounts:
+        if source in other.target.parents or target in other.target.parents:
+            raise SyncError(f"Nested mount at {other.target}. Unmount it before syncing.")
+
+
+def case_insensitive_pattern(name):
+    return "".join(
+        f"[{char.lower()}{char.upper()}]" if char.isascii() and char.isalpha() else char
+        for char in name
+    )
+
+
+def rsync_command(folder, mount):
+    command = ["rsync", "--recursive", "--times", "--omit-dir-times",
+               "--one-file-system"]
+    for path in (*folder.exclusions, MARKER):
+        command.extend(["--exclude", f"/{case_insensitive_pattern(path)}"])
+    if mount.filesystem in {"vfat", "msdos"}:
+        command.append("--modify-window=1")
+    if folder.suffixes:
+        command.extend(["--prune-empty-dirs", "--include", "*/"])
+        for suffix in folder.suffixes:
+            command.extend(["--include", f"*{case_insensitive_pattern(suffix)}"])
+        command.extend(["--exclude", "*"])
+    else:
+        command.append("--delete-after")
+    return command
+
+
+def abort_walk(error):
+    raise error
+
+
+def ascii_lower(name):
+    return re.sub(r"[A-Z]", lambda match: match[0].lower(), name)
+
+
+def entries(root, exclusions):
+    for directory, subdirs, files in os.walk(root, onerror=abort_walk):
+        subdir = Path(directory).relative_to(root)
+        if subdir == Path("."):
+            subdirs[:] = [name for name in subdirs if ascii_lower(name) not in exclusions]
+            files = [name for name in files if ascii_lower(name) not in exclusions]
+        for name in subdirs + files:
+            path = subdir / name
+            yield path, (root / path).lstat().st_mode
+
+
+def plan_filtered_deletions(source, target, mount, folder):
+    # Inventory matching paths separately so deletion reaches destination-only folders.
+    insensitive = mount.filesystem in {"exfat", "vfat", "msdos", "ntfs", "ntfs3", "fuseblk"}
+
+    def key(path):
+        name = str(path)
+        return name.casefold() if insensitive else name
+
+    selected = {}
+    files = set()
+    exclusions = {ascii_lower(name) for name in (*folder.exclusions, MARKER)}
+    for path, mode in entries(source, exclusions):
+        if stat.S_ISREG(mode) and ascii_lower(path.name).endswith(folder.suffixes):
+            files.add(key(path))
+            for part in (path, *path.parents):
+                name = key(part)
+                if selected.setdefault(name, part) != part:
+                    raise SyncError(f"Source paths differ only in capitalization: {selected[name]} and {part}.")
+
+    stale = []
+    for path, mode in entries(target, exclusions):
+        name = key(path)
+        if name in selected:
+            compatible = stat.S_ISREG(mode) if name in files else stat.S_ISDIR(mode)
+            if not compatible:
+                raise SyncError(f"Existing path {path} conflicts with the filtered mirror.")
+        elif stat.S_ISREG(mode) and ascii_lower(path.name).endswith(folder.suffixes):
+            stale.append(path)
+    return stale
+
+
+def remove_file(drive_fd, path, mount):
+    with ExitStack() as stack:
+        parent = drive_fd
+        for name in path.parts[:-1]:
+            parent = stack.enter_context(open_directory(name, parent))
+            check_mount(parent, mount)
+        mode = os.stat(path.name, dir_fd=parent, follow_symlinks=False).st_mode
+        if stat.S_ISREG(mode):
+            os.unlink(path.name, dir_fd=parent)
+            say(f"Removed {path}")
+
+
+def open_destination(stack, drive_fd, destination, mount, create=False):
+    parent = drive_fd
+    for name in destination.parts:
+        if create:
+            try:
+                os.mkdir(name, dir_fd=parent)
+            except FileExistsError:
+                pass
+        parent = stack.enter_context(open_directory(name, parent))
+        check_mount(parent, mount)
+    return parent
+
+
+def trial(command, paths, fds, allocation_unit):
+    result = subprocess.run(
+        [*command, "--dry-run", "--itemize-changes", "--out-format=%i %l", "--", *paths],
+        check=True, stdout=subprocess.PIPE, text=True, pass_fds=fds,
+    )
+    required = 0
+    for line in result.stdout.splitlines():
+        change, _, size = line.partition(" ")
+        if change.startswith((">f", "<f")):
+            length = int(size)
+            required += (length + allocation_unit - 1) // allocation_unit * allocation_unit
+    return required
+
+
+def mirror(mount, drive_fd, folders):
+    if not mount.writable:
+        raise SyncError(f"{mount.target} is mounted read-only.")
+    current_mounts = mounts()
+    updated = 0
+    with tempfile.TemporaryDirectory(prefix="sneakernet-") as scratch:
+        with ExitStack() as stack:
+            jobs = []
+            required = 0
+            volume = os.fstatvfs(drive_fd)
+            for folder in folders:
+                source = folder.source.resolve(strict=True)
+                validate_paths(source, mount.target, current_mounts)
+                source_fd = stack.enter_context(open_directory(source))
+                destination_fd = drive_fd
+                missing_destination = False
+                try:
+                    destination_fd = open_destination(stack, drive_fd, folder.destination, mount)
+                except FileNotFoundError:
+                    missing_destination = True
+                target = (f"{scratch}/" if missing_destination
+                          else f"/proc/self/fd/{destination_fd}/")
+                command = rsync_command(folder, mount)
+                source_path = f"/proc/self/fd/{source_fd}/"
+                fds = (source_fd, destination_fd)
+                stale = (plan_filtered_deletions(Path(source_path), Path(target), mount, folder)
+                         if folder.suffixes else [])
+                required += trial(command, (source_path, target), fds, volume.f_frsize)
+                jobs.append((folder, command, source_fd, destination_fd, missing_destination, stale))
+            free = volume.f_bavail * volume.f_frsize
+            if required > free:
+                raise SyncError(f"Need {required / 2**30:.2f} GiB for this transfer. "
+                                f"{mount.target} has {free / 2**30:.2f} GiB free.")
+            for folder, command, source_fd, destination_fd, missing_destination, stale in jobs:
+                if missing_destination:
+                    destination_fd = open_destination(
+                        stack, drive_fd, folder.destination, mount, create=True,
+                    )
+                say(f"Mirroring {folder.source} to {mount.target / folder.destination}")
+                with subprocess.Popen(
+                    [*command, "--itemize-changes", "--",
+                     f"/proc/self/fd/{source_fd}/", f"/proc/self/fd/{destination_fd}/"],
+                    stdout=subprocess.PIPE, text=True, errors="replace",
+                    pass_fds=(source_fd, destination_fd),
+                ) as transfer:
+                    for line in transfer.stdout:
+                        print(line, end="", flush=True)
+                        if line.startswith((">f", "<f")):
+                            updated += 1
+                    if transfer.wait():
+                        raise subprocess.CalledProcessError(transfer.returncode, transfer.args)
+                if stale:
+                    # Account for source changes during the copy before removing anything.
+                    current = set(plan_filtered_deletions(
+                        Path(f"/proc/self/fd/{source_fd}"), Path(f"/proc/self/fd/{destination_fd}"),
+                        mount, folder,
+                    ))
+                    for path in stale:
+                        if path in current:
+                            remove_file(destination_fd, path, mount)
+    subprocess.run(["sync", "-f", "--", f"/proc/self/fd/{drive_fd}"],
+                   check=True, pass_fds=(drive_fd,))
+    return updated
+
+
+def scan(seen):
+    candidates = list(usb_mounts())
+    seen.intersection_update(map(mount_key, candidates))
+    count = failures = 0
+    for mount in candidates:
+        key = mount_key(mount)
+        if key in seen:
+            continue
+        try:
+            with open_directory(mount.target) as drive_fd:
+                check_mount(drive_fd, mount)
+                folders = read_marker(drive_fd)
+                if not folders:
+                    continue
+                seen.add(key)
+                count += 1
+                notify("SneakerNet in progress", f"Please don’t eject {mount.target.name}.")
+                updated = mirror(mount, drive_fd, folders)
+            files = "file" if updated == 1 else "files"
+            notify("SneakerNet complete",
+                   f"{updated} {files} updated. You can eject {mount.target.name} normally.")
+        except (OSError, ValueError, RuntimeError, SyncError, subprocess.SubprocessError) as error:
+            failures += 1
+            seen.add(key)
+            notify("SneakerNet failed", f"{mount.target.name}: {error}")
+    return count, failures
+
+
+def watch():
+    say(f"SneakerNet {VERSION} is watching mounted USB drives.")
+    while True:
+        with sync_lock(blocking=False) as fd:
+            if fd is not None:
+                try:
+                    scan_locked(fd)
+                except (OSError, ValueError, subprocess.SubprocessError) as error:
+                    say(f"USB scan failed: {error}")
+        time.sleep(POLL_INTERVAL)
+
+
+def scan_now():
+    with sync_lock() as fd:
+        count, failures = scan_locked(fd, rescan=True)
+    if not count and not failures:
+        say(f"No mounted USB drive has folders enabled for {hostname()} in {MARKER}.")
+    return int(bool(failures))
+
+
+def scan_locked(fd, rescan=False):
+    previous = os.pread(fd, 65536, 0)
+    try:
+        saved = json.loads(previous) if previous and not rescan else []
+    except ValueError:
+        saved = []
+    seen = {key for key in saved if isinstance(key, str)} if isinstance(saved, list) else set()
+    result = scan(seen)
+    updated = json.dumps(sorted(seen)).encode()
+    if previous != updated:
+        os.pwrite(fd, updated, 0)
+        os.ftruncate(fd, len(updated))
+    return result
+
+
+def toml_string(value):
+    # TOML uses a Unicode escape for DEL. JSON likewise escapes C0 control characters.
+    return json.dumps(value, ensure_ascii=False).replace("\x7f", r"\u007f")
+
+
+def toml_key(value):
+    return value if re.fullmatch(r"[A-Za-z0-9_-]+", value) else toml_string(value)
+
+
+def format_marker(settings_list):
+    host = toml_key(hostname())
+    header = f"[{host}]" if len(settings_list) == 1 else f"[[{host}]]"
+    sections = []
+    for settings in settings_list:
+        types = settings["file_types"]
+        entries = [header, f'source = {toml_string(settings["source"])}',
+                   f'destination = {toml_string(settings["destination"])}']
+        if len(types) == 1:
+            selection = toml_string(types[0])
+        else:
+            selection = f"[{', '.join(map(toml_string, types))}]"
+        entries.append(f"file_types = {selection}")
+        if settings["exclude"]:
+            entries.append(f'exclude = [{", ".join(map(toml_string, settings["exclude"]))}]')
+        sections.append("\n".join(entries))
+    return "\n\n".join(sections) + "\n"
+
+
+def interactive_setup():
+    if not sys.stdin.isatty():
+        raise SyncError("Run setup in a terminal or supply the mount path, source, and destination.")
+    candidates = [mount.target for mount in usb_mounts()
+                  if mount.writable and not os.path.lexists(mount.target / MARKER)
+                  and os.access(mount.target, os.W_OK)]
+    if not candidates:
+        raise SyncError(f"No writable USB drive without a {MARKER} file is mounted.")
+    say("Mounted USB drives available for setup")
+    for number, target in enumerate(candidates, start=1):
+        say(f"  {number}. {target}")
+    while True:
+        selection = input("Drive number [1]: ").strip() or "1"
+        if selection.isascii() and selection.isdigit() and len(selection) <= len(str(len(candidates))):
+            number = int(selection)
+            if 1 <= number <= len(candidates):
+                target = candidates[number - 1]
+                break
+        say("Choose a number from the list.")
+
+    say(f"Configuring {target} for {hostname()}.")
+    settings_list = []
+    while True:
+        source = input("Absolute source directory: ").strip()
+        default_target = "." if not settings_list else ""
+        prompt = "Destination on the drive [. for the root]: " if default_target else "Destination on the drive: "
+        destination = input(prompt).strip() or default_target
+        types = input("File types, separated by spaces [all]: ").split() or ["all"]
+        excluded = input("Top-level entries to preserve, comma-separated [none]: ")
+        exclusions = [name.strip() for name in excluded.split(",") if name.strip()]
+        settings = {"source": source, "destination": destination, "file_types": types, "exclude": exclusions}
+        try:
+            folders = load_folders([*settings_list, settings])
+            if not folders[-1].source.is_dir():
+                raise SyncError(f"Source directory {source} is missing.")
+        except SyncError as error:
+            say(str(error))
+            continue
+        settings_list.append(settings)
+        if folders[-1].destination == Path("."):
+            break
+        if input("Add another folder? [y/N]: ").strip().lower() not in {"y", "yes"}:
+            break
+    setup(target, settings_list, confirm=True)
+
+
+def setup(target, settings_list, confirm=False):
+    folders = load_folders(settings_list)
+    target = target.resolve(strict=True)
+    mount = next((mount for mount in usb_mounts() if mount.target == target), None)
+    if mount is None:
+        raise SyncError(f"{target} is not the root of a mounted USB data volume.")
+    if not mount.writable:
+        raise SyncError(f"{target} is mounted read-only.")
+    contents = format_marker(settings_list)
+    if len(contents.encode("utf-8")) > 65536:
+        raise SyncError(f"{MARKER} exceeds 64 KiB.")
+    if confirm:
+        say(f"Write {target / MARKER} with these settings?\n\n{contents}")
+        say("Mirroring removes matching destination files that are absent from the source.")
+        if input("Save and enable syncing? [y/N]: ").strip().lower() not in {"y", "yes"}:
+            say("Setup canceled.")
+            return
+    with sync_lock(), open_directory(target) as drive_fd:
+        for folder in folders:
+            if not folder.source.is_dir():
+                raise SyncError(f"Source directory {folder.source} is missing.")
+        check_mount(drive_fd, mount)
+        try:
+            fd = os.open(MARKER, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644, dir_fd=drive_fd)
+        except FileExistsError:
+            raise SyncError(f"{target / MARKER} already exists. Edit it to change the folder list.") from None
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                stream.write(contents)
+                stream.flush()
+                os.fsync(stream.fileno())
+        except OSError:
+            os.unlink(MARKER, dir_fd=drive_fd)
+            raise
+    say(f"Configured {target}. Run sneakernet scan to sync now.")
+
+
+def need_user():
+    if os.geteuid() == 0:
+        raise SyncError("Run SneakerNet as your desktop user. The installer asks for sudo if needed.")
+
+
+def systemctl(*args):
+    subprocess.run(["systemctl", "--user", *args], check=True)
+
+
+def install_dependencies():
+    distro = platform.freedesktop_os_release().get("ID", "")
+    fedora = distro == "fedora"
+    packages = {
+        "rsync": "rsync",
+        "lsblk": "util-linux",
+        "sync": "coreutils",
+        "notify-send": "libnotify" if fedora else "libnotify-bin",
+    }
+    missing = [package for command, package in packages.items() if not shutil.which(command)]
+    if not missing:
+        return
+    if not (fedora or distro in {"debian", "ubuntu"}):
+        raise SyncError(f"Install these packages with your distribution’s package manager: {', '.join(missing)}.")
+    command = ["sudo", "dnf" if fedora else "apt-get", "install", *missing]
+    say(f"Missing dependencies. The installer can run {shlex.join(command)}.")
+    if not sys.stdin.isatty() or input("Install these packages? [y/N] ").strip().lower() not in {"y", "yes"}:
+        raise SyncError("Install the listed packages and run the installer again.")
+    subprocess.run(command, check=True)
+    if any(not shutil.which(command) for command in packages):
+        raise SyncError("Some dependencies are still missing.")
+
+
+def write_atomic(path, content, mode):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as stream:
+        temporary = Path(stream.name)
+        try:
+            stream.write(content)
+            stream.flush()
+            os.fchmod(stream.fileno(), mode)
+            temporary.replace(path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
+def manage_installation(installing):
+    need_user()
+    binary = Path.home() / ".local" / "bin" / "sneakernet"
+    unit = config_home() / "systemd" / "user" / UNIT
+    if installing:
+        install_dependencies()
+    subprocess.run(["systemctl", "--user", "show-environment"],
+                   stdout=subprocess.DEVNULL, check=True)
+    if installing:
+        with sync_lock():
+            source = Path(__file__).resolve()
+            if source != binary:
+                write_atomic(binary, source.read_bytes(), 0o755)
+            write_atomic(unit, SERVICE.encode(), 0o644)
+            systemctl("daemon-reload")
+            systemctl("enable", UNIT)
+            systemctl("restart", UNIT)
+        say(f"Installed SneakerNet {VERSION} to {binary}.")
+        if not shutil.which("sneakernet"):
+            say(f"Use {binary} or add {binary.parent} to your PATH.")
+        return
+    with sync_lock() as fd:
+        if unit.exists():
+            systemctl("disable", "--now", UNIT)
+            unit.unlink()
+            systemctl("daemon-reload")
+        binary.unlink(missing_ok=True)
+        os.ftruncate(fd, 0)
+    say("Uninstalled SneakerNet.")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Mirror folders to configured USB drives.")
+    parser.add_argument("--version", action="version", version=f"SneakerNet {VERSION}")
+    parser.add_argument("--uninstall", action="store_true", help="remove the user service and CLI")
+    commands = parser.add_subparsers(dest="command")
+    commands.add_parser("install", help="install or update the user service")
+    commands.add_parser("uninstall", help="remove the user service and CLI")
+    commands.add_parser("scan", help="scan mounted USB drives and sync now")
+    drive_setup = commands.add_parser("setup", help="write a folder configuration to a USB drive")
+    drive_setup.add_argument("mountpoint", type=Path, nargs="?")
+    drive_setup.add_argument("source", nargs="?", help="absolute path to the source directory")
+    drive_setup.add_argument("destination", nargs="?", help="path relative to the drive root")
+    drive_setup.add_argument("--file-types", nargs="+",
+                             help="file extensions to mirror, or all (default)")
+    drive_setup.add_argument("--exclude", action="append", help="top-level entry to preserve")
+    commands.add_parser("watch", help="run the USB watcher in the foreground")
+    args = parser.parse_args()
+    if args.uninstall and args.command:
+        parser.error("Choose one command.")
+    try:
+        if args.command == "scan":
+            need_user()
+            return scan_now()
+        if args.uninstall or args.command in {"install", "uninstall"}:
+            manage_installation(args.command == "install")
+        elif args.command == "setup":
+            need_user()
+            positionals = (args.mountpoint, args.source, args.destination)
+            if all(value is None for value in (*positionals, args.file_types, args.exclude)):
+                interactive_setup()
+            elif any(value is None for value in positionals):
+                drive_setup.error("Supply the mount path, source, and destination, or run setup without arguments.")
+            else:
+                setup(args.mountpoint, [{"source": args.source, "destination": args.destination,
+                                         "file_types": args.file_types or ["all"], "exclude": args.exclude or []}])
+        elif args.command == "watch":
+            need_user()
+            watch()
+        else:
+            parser.print_help()
+    except KeyboardInterrupt:
+        return 130
+    except EOFError:
+        print("SneakerNet: Setup canceled.", file=sys.stderr)
+        return 1
+    except (OSError, ValueError, RuntimeError, SyncError, subprocess.SubprocessError) as error:
+        print(f"SneakerNet: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
